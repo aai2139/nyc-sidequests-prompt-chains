@@ -6,6 +6,17 @@ import type { ChainStep, PromptChain } from "@/lib/types";
 
 type Media = { data: string; mimeType: string; path: string };
 
+function isTemporaryModelError(error: unknown) {
+  const status = typeof error === "object" && error !== null && "status" in error
+    ? Number((error as { status?: unknown }).status)
+    : typeof error === "object" && error !== null && "code" in error
+      ? Number((error as { code?: unknown }).code)
+      : 0;
+  const message = error instanceof Error ? error.message.toLowerCase() : JSON.stringify(error).toLowerCase();
+  return status === 408 || status === 429 || status >= 500 ||
+    /high demand|unavailable|timeout|aborted|temporar/.test(message);
+}
+
 function extension(mimeType: string) {
   return mimeType === "image/png" ? "png" : mimeType === "image/webp" ? "webp" : mimeType === "image/gif" ? "gif" : "jpg";
 }
@@ -57,14 +68,38 @@ export async function runChain(input: {
       ].filter(Boolean).join("\n\n");
       const parts: Array<{ text: string } | { inlineData: { data: string; mimeType: string } }> = [{ text: prompt }];
       if (previousMedia) parts.push({ inlineData: { data: previousMedia.data, mimeType: previousMedia.mimeType } });
-      const model = step.model_name || (step.output_type === "image"
+      const primaryModel = step.model_name || (step.output_type === "image"
         ? process.env.GEMINI_IMAGE_MODEL || "gemini-3.1-flash-image-preview"
         : process.env.GEMINI_MODEL || "gemini-3.8-flash");
-      const response = await ai.models.generateContent({
-        model,
-        contents: [{ role: "user", parts }],
-        config: step.output_type === "image" ? { responseModalities: [Modality.TEXT, Modality.IMAGE] } : undefined,
-      });
+      const fallbackModels = step.model_name ? [] : step.output_type === "image"
+        ? [process.env.GEMINI_IMAGE_FALLBACK_MODEL]
+        : [
+            process.env.GEMINI_QUALITY_FALLBACK_MODEL || "gemini-3.6-flash",
+            process.env.GEMINI_FALLBACK_MODEL || "gemini-3.5-flash-lite",
+          ];
+      const modelCandidates = [...new Set([primaryModel, ...fallbackModels].filter((value): value is string => Boolean(value)))];
+      let activeModel = primaryModel;
+      let response: Awaited<ReturnType<typeof ai.models.generateContent>> | undefined;
+      let lastError: unknown;
+      for (const [modelIndex, model] of modelCandidates.entries()) {
+        try {
+          response = await ai.models.generateContent({
+            model,
+            contents: [{ role: "user", parts }],
+            config: {
+              httpOptions: { timeout: 35_000, retryOptions: { attempts: 2 } },
+              ...(step.output_type === "image" ? { responseModalities: [Modality.TEXT, Modality.IMAGE] } : {}),
+            },
+          });
+          activeModel = model;
+          break;
+        } catch (error) {
+          lastError = error;
+          if (!isTemporaryModelError(error) || modelIndex === modelCandidates.length - 1) throw error;
+          console.warn(`Gemini ${model} was temporarily unavailable; trying ${modelCandidates[modelIndex + 1]}`);
+        }
+      }
+      if (!response) throw lastError ?? new Error(`Step ${step.step_order} returned no response.`);
       const responseParts = response.candidates?.[0]?.content?.parts ?? [];
       const outputText = responseParts.map((part) => part.text ?? "").join("\n").trim() || response.text?.trim() || "";
       let outputMedia: Media | null = null;
@@ -79,7 +114,7 @@ export async function runChain(input: {
       if (step.output_type === "text" && !outputText) throw new Error(`Step ${step.step_order} did not return text.`);
       await admin.from("prompt_chain_run_steps").insert({
         run_id: run.id, step_id: step.id, step_order: step.step_order, step_name: step.name,
-        output_type: step.output_type, model_name: model, input_text: previousText || null,
+        output_type: step.output_type, model_name: activeModel, input_text: previousText || null,
         input_media_path: previousMedia?.path ?? null, output_text: outputText || null,
         output_media_path: outputMedia?.path ?? null, latency_ms: Date.now() - started,
       });
